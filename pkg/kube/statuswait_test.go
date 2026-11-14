@@ -29,6 +29,7 @@ import (
 	"github.com/fluxcd/cli-utils/pkg/kstatus/polling/engine"
 	"github.com/fluxcd/cli-utils/pkg/kstatus/polling/event"
 	"github.com/fluxcd/cli-utils/pkg/kstatus/status"
+	"github.com/fluxcd/cli-utils/pkg/kstatus/watcher"
 	"github.com/fluxcd/cli-utils/pkg/object"
 	"github.com/fluxcd/cli-utils/pkg/testutil"
 	"github.com/stretchr/testify/assert"
@@ -1802,4 +1803,93 @@ func TestWatchUntilReadyWithCustomReaders(t *testing.T) {
 			assert.NoError(t, err)
 		})
 	}
+}
+
+// lateEventWatcher replays events the way the default status watcher can
+// deliver them: first the events that bring every resource to the desired
+// status, then, after the waiter's observer has cancelled the watch, events
+// that were already in flight. An informer event handler checks its context
+// before it computes a status and sends the result unconditionally, and the
+// event funnel drains every input channel until its informer has stopped, so
+// an update the API server sent just before the cancel still reaches the
+// collector after it.
+type lateEventWatcher struct {
+	beforeCancel []event.Event
+	afterCancel  []event.Event
+}
+
+func (w lateEventWatcher) Watch(ctx context.Context, _ object.ObjMetadataSet, _ watcher.Options) <-chan event.Event {
+	ch := make(chan event.Event)
+	go func() {
+		defer close(ch)
+		for _, e := range w.beforeCancel {
+			ch <- e
+		}
+		<-ctx.Done()
+		for _, e := range w.afterCancel {
+			ch <- e
+		}
+	}()
+	return ch
+}
+
+func resourceUpdate(id object.ObjMetadata, s status.Status, msg string) event.Event {
+	return event.Event{
+		Type:     event.ResourceUpdateEvent,
+		Resource: &event.ResourceStatus{Identifier: id, Status: s, Message: msg},
+	}
+}
+
+func TestStatusWaitIgnoresEventsAfterTheWaitEnded(t *testing.T) {
+	t.Parallel()
+	c := newTestClient(t)
+	sw := statusWaiter{}
+	sw.SetLogger(slog.Default().Handler())
+
+	objs := getRuntimeObjFromManifests(t, []string{podCurrentManifest, podNoStatusManifest})
+	resourceList := getResourceListFromRuntimeObjs(t, c, objs)
+	ids := make([]object.ObjMetadata, 0, len(objs))
+	for _, obj := range objs {
+		id, err := object.RuntimeToObjMeta(obj)
+		require.NoError(t, err)
+		ids = append(ids, id)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	start := time.Now()
+	err := sw.wait(ctx, resourceList, lateEventWatcher{
+		beforeCancel: []event.Event{
+			resourceUpdate(ids[0], status.CurrentStatus, "Resource is current"),
+			resourceUpdate(ids[1], status.CurrentStatus, "Resource is current"),
+		},
+		// A controller's first status write arriving just after the wait
+		// saw every resource Current, as for a custom resource kstatus reads
+		// as Current before its controller has written a condition.
+		afterCancel: []event.Event{
+			resourceUpdate(ids[1], status.InProgressStatus, "Not Ready"),
+		},
+	})
+	require.NoError(t, err)
+	assert.Less(t, time.Since(start), 10*time.Second, "the wait ends when every resource is Current")
+}
+
+func TestStatusWaitForDeleteIgnoresEventsAfterTheWaitEnded(t *testing.T) {
+	t.Parallel()
+	c := newTestClient(t)
+	sw := statusWaiter{}
+	sw.SetLogger(slog.Default().Handler())
+
+	objs := getRuntimeObjFromManifests(t, []string{podCurrentManifest})
+	resourceList := getResourceListFromRuntimeObjs(t, c, objs)
+	id, err := object.RuntimeToObjMeta(objs[0])
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	err = sw.waitForDelete(ctx, resourceList, lateEventWatcher{
+		beforeCancel: []event.Event{resourceUpdate(id, status.NotFoundStatus, "Resource not found")},
+		afterCancel:  []event.Event{resourceUpdate(id, status.CurrentStatus, "Resource is current")},
+	})
+	require.NoError(t, err)
 }
