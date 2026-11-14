@@ -154,7 +154,8 @@ func (w *statusWaiter) waitForDelete(ctx context.Context, resourceList ResourceL
 		RESTScopeStrategy: watcher.RESTScopeNamespace,
 	})
 	statusCollector := collector.NewResourceStatusCollector(resources)
-	done := statusCollector.ListenWithObserver(eventCh, statusObserver(cancel, status.NotFoundStatus, w.Logger()))
+	observer := newStatusObserver(cancel, status.NotFoundStatus, w.Logger())
+	done := statusCollector.ListenWithObserver(eventCh, observer)
 	<-done
 
 	if statusCollector.Error != nil {
@@ -163,7 +164,7 @@ func (w *statusWaiter) waitForDelete(ctx context.Context, resourceList ResourceL
 
 	errs := []error{}
 	for _, id := range resources {
-		rs := statusCollector.ResourceStatuses[id]
+		rs := observer.final(statusCollector, id)
 		if rs.Status == status.NotFoundStatus || rs.Status == status.UnknownStatus {
 			continue
 		}
@@ -198,7 +199,8 @@ func (w *statusWaiter) wait(ctx context.Context, resourceList ResourceList, sw w
 		RESTScopeStrategy: watcher.RESTScopeNamespace,
 	})
 	statusCollector := collector.NewResourceStatusCollector(resources)
-	done := statusCollector.ListenWithObserver(eventCh, statusObserver(cancel, status.CurrentStatus, w.Logger()))
+	observer := newStatusObserver(cancel, status.CurrentStatus, w.Logger())
+	done := statusCollector.ListenWithObserver(eventCh, observer)
 	<-done
 
 	if statusCollector.Error != nil {
@@ -207,7 +209,7 @@ func (w *statusWaiter) wait(ctx context.Context, resourceList ResourceList, sw w
 
 	errs := []error{}
 	for _, id := range resources {
-		rs := statusCollector.ResourceStatuses[id]
+		rs := observer.final(statusCollector, id)
 		if rs.Status == status.CurrentStatus {
 			continue
 		}
@@ -237,44 +239,84 @@ func contextWithTimeout(ctx context.Context, timeout time.Duration) (context.Con
 	return watchtools.ContextWithOptionalTimeout(ctx, timeout)
 }
 
-func statusObserver(cancel context.CancelFunc, desired status.Status, logger *slog.Logger) collector.ObserverFunc {
-	return func(statusCollector *collector.ResourceStatusCollector, _ event.Event) {
-		var rss []*event.ResourceStatus
-		var nonDesiredResources []*event.ResourceStatus
-		for _, rs := range statusCollector.ResourceStatuses {
-			if rs == nil {
-				continue
-			}
-			// If a resource is already deleted before waiting has started, it will show as unknown.
-			// This check ensures we don't wait forever for a resource that is already deleted.
-			if rs.Status == status.UnknownStatus && desired == status.NotFoundStatus {
-				continue
-			}
-			// Failed is a terminal state. This check ensures we don't wait forever for a resource
-			// that has already failed, as intervention is required to resolve the failure.
-			if rs.Status == status.FailedStatus && desired == status.CurrentStatus {
-				continue
-			}
-			rss = append(rss, rs)
-			if rs.Status != desired {
-				nonDesiredResources = append(nonDesiredResources, rs)
-			}
-		}
+// statusObserver ends a wait once every resource has the desired status.
+//
+// The watch keeps delivering events after it is cancelled: an informer event
+// handler that passed its context check before the cancel still sends its
+// update, and the event funnel drains it. Such an event must not change the
+// outcome of a wait that has already ended, so the observer keeps the
+// statuses that ended it, and the wait judges those.
+type statusObserver struct {
+	cancel  context.CancelFunc
+	desired status.Status
+	logger  *slog.Logger
+	// achieved holds every resource's status at the event that ended the
+	// wait; nil until then.
+	achieved map[object.ObjMetadata]event.ResourceStatus
+}
 
-		if aggregator.AggregateStatus(rss, desired) == desired {
-			logger.Debug("all resources achieved desired status", "desiredStatus", desired, "resourceCount", len(rss))
-			cancel()
-			return
-		}
+func newStatusObserver(cancel context.CancelFunc, desired status.Status, logger *slog.Logger) *statusObserver {
+	return &statusObserver{cancel: cancel, desired: desired, logger: logger}
+}
 
-		if len(nonDesiredResources) > 0 {
-			// Log a single resource so the user knows what they're waiting for without an overwhelming amount of output
-			sort.Slice(nonDesiredResources, func(i, j int) bool {
-				return nonDesiredResources[i].Identifier.Name < nonDesiredResources[j].Identifier.Name
-			})
-			first := nonDesiredResources[0]
-			logger.Debug("waiting for resource", "namespace", first.Identifier.Namespace, "name", first.Identifier.Name, "kind", first.Identifier.GroupKind.Kind, "expectedStatus", desired, "actualStatus", first.Status)
+// final is the status the wait judges for id: the one that ended the wait,
+// or the latest one when the wait ended otherwise (timeout, cancellation).
+// It is read after the collector has stopped.
+func (o *statusObserver) final(statusCollector *collector.ResourceStatusCollector, id object.ObjMetadata) *event.ResourceStatus {
+	if o.achieved != nil {
+		if rs, ok := o.achieved[id]; ok {
+			return &rs
 		}
+	}
+	return statusCollector.ResourceStatuses[id]
+}
+
+func (o *statusObserver) Notify(statusCollector *collector.ResourceStatusCollector, _ event.Event) {
+	if o.achieved != nil {
+		// The wait has ended; later events do not change its outcome.
+		return
+	}
+	var rss []*event.ResourceStatus
+	var nonDesiredResources []*event.ResourceStatus
+	for _, rs := range statusCollector.ResourceStatuses {
+		if rs == nil {
+			continue
+		}
+		// If a resource is already deleted before waiting has started, it will show as unknown.
+		// This check ensures we don't wait forever for a resource that is already deleted.
+		if rs.Status == status.UnknownStatus && o.desired == status.NotFoundStatus {
+			continue
+		}
+		// Failed is a terminal state. This check ensures we don't wait forever for a resource
+		// that has already failed, as intervention is required to resolve the failure.
+		if rs.Status == status.FailedStatus && o.desired == status.CurrentStatus {
+			continue
+		}
+		rss = append(rss, rs)
+		if rs.Status != o.desired {
+			nonDesiredResources = append(nonDesiredResources, rs)
+		}
+	}
+
+	if aggregator.AggregateStatus(rss, o.desired) == o.desired {
+		o.logger.Debug("all resources achieved desired status", "desiredStatus", o.desired, "resourceCount", len(rss))
+		o.achieved = make(map[object.ObjMetadata]event.ResourceStatus, len(statusCollector.ResourceStatuses))
+		for id, rs := range statusCollector.ResourceStatuses {
+			if rs != nil {
+				o.achieved[id] = *rs
+			}
+		}
+		o.cancel()
+		return
+	}
+
+	if len(nonDesiredResources) > 0 {
+		// Log a single resource so the user knows what they're waiting for without an overwhelming amount of output
+		sort.Slice(nonDesiredResources, func(i, j int) bool {
+			return nonDesiredResources[i].Identifier.Name < nonDesiredResources[j].Identifier.Name
+		})
+		first := nonDesiredResources[0]
+		o.logger.Debug("waiting for resource", "namespace", first.Identifier.Namespace, "name", first.Identifier.Name, "kind", first.Identifier.GroupKind.Kind, "expectedStatus", o.desired, "actualStatus", first.Status)
 	}
 }
 
