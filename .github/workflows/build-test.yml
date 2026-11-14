@@ -5,10 +5,12 @@ on:
       - "main"
       - "dev-v3"
       - "release-**"
+      - "giantswarm"
   pull_request:
     branches:
       - "main"
       - "dev-v3"
+      - "giantswarm"
 
 permissions:
   contents: read
