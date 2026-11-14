@@ -1,5 +1,3 @@
-# Security Policy
+# Helm Security Reporting and Policy
 
-## Reporting a Vulnerability
-
-Please visit <https://www.giantswarm.io/responsible-disclosure> for information on reporting security issues.
+The Helm project has [a common process and policy that can be found here](https://github.com/helm/community/blob/master/SECURITY.md).
